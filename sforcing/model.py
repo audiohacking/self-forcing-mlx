@@ -89,19 +89,14 @@ class AttentionBlock(nn.Module):
         """
         # Unfold time embedding into 6 modulation scalars
         mod = (self.modulation + e).reshape(-1, 6, self.dim)  # (B, 6, dim)
-        # MLX split differs from PyTorch — use indexing instead
+        # Keep (B, 1, dim) for correct broadcasting with (B, L, dim)
         e0, e1, e2, e3, e4, e5 = [mod[:, i:i+1, :] for i in range(6)]
-        e0 = e0.squeeze(1)
-        e1 = e1.squeeze(1)
-        e2 = e2.squeeze(1)
-        e3 = e3.squeeze(1)
-        e4 = e4.squeeze(1)
-        e5 = e5.squeeze(1)
 
         # Self-attention: norm1(x) * (1 + e1) + e0 -> attn -> x + out * e2
         norm1_out = self.norm1(x)
         x_attn_input = norm1_out * (1.0 + e1) + e0
-        sa_out = self.self_attn(x_attn_input, grid_sizes, freqs, kv_cache=kv_cache)
+        sa_out = self.self_attn(x_attn_input, grid_sizes, freqs, kv_cache=kv_cache,
+                                seq_lens=seq_lens)
         x = x + sa_out * e2
 
         # Cross-attention: norm3(x) -> cross_attn -> x + out
@@ -145,8 +140,9 @@ class Head(nn.Module):
             Output, shape (B, L, out_channels).
         """
         mod = (self.modulation + e.reshape(-1, 1, self.dim))
-        e0 = mod[:, 0:1, :].squeeze(1)
-        e1 = mod[:, 1:2, :].squeeze(1)
+        # Keep (B, 1, dim) for correct broadcasting with (B, L, dim)
+        e0 = mod[:, 0:1, :]
+        e1 = mod[:, 1:2, :]
         out = self.head(self.norm(x) * (1.0 + e1) + e0)
         return out
 

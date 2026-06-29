@@ -150,7 +150,7 @@ class CausalInferencePipeline:
             shared_pos=False,
             dropout=0.1,
         )
-        self._load_weights(self.t5, t5_path)
+        self.t5.load_weights(t5_path)
         print("T5 encoder loaded.")
 
         # --- Load transformer ---
@@ -168,7 +168,7 @@ class CausalInferencePipeline:
             patch_size=PATCH_SIZE,
             eps=EPS,
         )
-        self._load_weights(self.model, transformer_path)
+        self.model.load_weights(transformer_path)
         print("Transformer loaded.")
 
         # --- Load VAE decoder ---
@@ -199,74 +199,7 @@ class CausalInferencePipeline:
         self._crossattn_caches_pos = None
         self._crossattn_caches_neg = None
 
-    def _load_weights(self, model, path):
-        """Load weights from .safetensors into an MLX model."""
-        from safetensors import safe_open
-        params = {}
-        with safe_open(path, framework="numpy") as f:
-            for key in f.keys():
-                params[key] = np.array(f.get_tensor(key))
-        mlx_params = self._mlxify_params(params)
-        weights = self._build_weight_dict(model, mlx_params)
-        model.update(weights)
-
-    def _mlxify_params(self, pytorch_params):
-        """Map PyTorch parameter names to MLX names."""
-        import re
-        mlx_params = {}
-        for key, value in pytorch_params.items():
-            ml_key = key
-            if ml_key.startswith("encoder."):
-                ml_key = ml_key[8:]
-            ml_key = re.sub(r'\.(\d+)\.', r'[\1].', ml_key)
-            mlx_params[ml_key] = value
-        return mlx_params
-
-    def _build_weight_dict(self, model, params):
-        """Build nested weight dict matching model structure for model.update()."""
-        weight_dict = {}
-        for ml_key, np_arr in params.items():
-            mx_arr = mx.array(np_arr)
-            self._set_nested(weight_dict, ml_key, mx_arr)
-        return weight_dict
-
-    def _set_nested(self, d, key_path, value):
-        """Set a nested dict value using dot notation with bracket indices."""
-        import re
-        parts = re.split(r'\.(?![0-9])', key_path)
-        current = d
-        for i, part in enumerate(parts[:-1]):
-            if '[' in part:
-                base, idx = part.split('[')
-                idx = int(idx.rstrip(']'))
-                if base not in current:
-                    current[base] = {}
-                base_key = base
-                if not isinstance(current[base_key], list):
-                    current[base_key] = {}
-                lst = current[base_key].setdefault('_list', [])
-                while len(lst) <= idx:
-                    lst.append({})
-                current = lst[idx]
-            else:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-
-        last = parts[-1]
-        if '[' in last:
-            base, idx = last.split('[')
-            idx = int(idx.rstrip(']'))
-            if base not in current:
-                current[base] = {}
-            base_key = base
-            lst = current[base_key].setdefault('_list', [])
-            while len(lst) <= idx:
-                lst.append({})
-            current = lst[idx]
-            current['_value'] = value
-        else:
-            current[last] = value
+    # Weight loading is handled by each model's own load_weights() method
 
     def _initialize_caches(self, batch_size=1):
         """Initialize all KV caches for a new generation."""
@@ -317,12 +250,11 @@ class CausalInferencePipeline:
         b, t, c, h, w = latents.shape
 
         # Convert to list of (C, T, H, W) for model
-        x_list = [latents[i].transpose(2, 0, 1, 3, 4) for i in range(b)]
-
-        grid_sizes = np.array([[self.ft, h, w]], dtype=np.int32)
+        # latents[i] is (T, C, H, W) -> transpose to (C, T, H, W)
+        x_list = [latents[i].transpose(1, 0, 2, 3) for i in range(b)]
 
         outputs = self.model(
-            x_list, timestep, context, self.max_seq_len, grid_sizes,
+            x_list, timestep, context, self.max_seq_len,
             kv_caches=kv_caches, crossattn_caches=crossattn_caches,
         )
 
@@ -411,6 +343,17 @@ class CausalInferencePipeline:
             ]
             latents = noisy_input
 
+            # Save cache positions so the clean update can REPLACE noisy tokens
+            # (instead of appending, which would overflow the cache)
+            pos_cache_local_pos = [
+                cache["local_end_index"].item()
+                for cache in self._kv_caches_pos
+            ]
+            pos_cache_local_neg = [
+                cache["local_end_index"].item()
+                for cache in self._kv_caches_neg
+            ]
+
             # Spatial denoising loop over timesteps
             for step_idx, current_timestep in enumerate(self.denoising_step_list):
                 timestep = mx.array([current_timestep], dtype=mx.float32)
@@ -439,6 +382,12 @@ class CausalInferencePipeline:
 
             # Store denoised block
             output[:, current_start_frame:current_start_frame + current_num_frames] = latents
+
+            # Restore cache positions so clean update REPLACES noisy entries
+            for cache, saved_pos in zip(self._kv_caches_pos, pos_cache_local_pos):
+                cache["local_end_index"] = mx.array([saved_pos], dtype=mx.int32)
+            for cache, saved_pos in zip(self._kv_caches_neg, pos_cache_local_neg):
+                cache["local_end_index"] = mx.array([saved_pos], dtype=mx.int32)
 
             # Update KV cache with clean context (timestep=0)
             clean_latents = output[:, current_start_frame:current_start_frame + current_num_frames]
@@ -511,7 +460,7 @@ class CausalInferencePipeline:
         vae_input = latents.transpose(0, 2, 1, 3, 4)
         out = self.vae.decode(vae_input)
         # Normalize [-1, 1] -> [0, 1]
-        pixels = (out * 0.5 + 0.5).clip(0, 1)
+        pixels = mx.clip(out * 0.5 + 0.5, 0, 1)
         return pixels
 
     def _save_video(self, pixels, output_path):

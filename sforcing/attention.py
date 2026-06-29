@@ -73,7 +73,8 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps, elementwise_affine=True) if qk_norm else None
         self.norm_k = WanRMSNorm(dim, eps=eps, elementwise_affine=True) if qk_norm else None
 
-    def __call__(self, x, grid_sizes, freqs, causal_mask=None, kv_cache=None):
+    def __call__(self, x, grid_sizes, freqs, causal_mask=None, kv_cache=None,
+                 seq_lens=None):
         """Forward pass for self-attention.
 
         Args:
@@ -82,6 +83,8 @@ class WanSelfAttention(nn.Module):
             freqs: Precomputed RoPE frequencies.
             causal_mask: Optional causal mask for autoregressive attention.
             kv_cache: Optional dict with 'k', 'v', 'global_end_index', 'local_end_index'.
+            seq_lens: Optional actual sequence lengths, shape (B,). When provided
+                      with kv_cache, only actual tokens (not padding) are stored.
 
         Returns:
             Output tensor, shape (B, L, dim).
@@ -99,25 +102,27 @@ class WanSelfAttention(nn.Module):
 
         # KV cache management for autoregressive inference
         if kv_cache is not None:
-            # Compute cache positions
             cache_local = kv_cache["local_end_index"].item()
             cache_global = kv_cache["global_end_index"].item()
 
-            # Store new K,V in cache
-            kv_cache["k"][:, cache_local:cache_local + s] = k
-            kv_cache["v"][:, cache_local:cache_local + s] = v
-            kv_cache["global_end_index"] = mx.array([cache_global + s], dtype=mx.int32)
-            kv_cache["local_end_index"] = mx.array([cache_local + s], dtype=mx.int32)
+            # Use actual sequence length (not padded length) for cache ops
+            actual_s = seq_lens[0].item() if seq_lens is not None else s
 
-            # Use full cached K,V for attention
-            full_s = cache_local + s
+            # Store only actual (non-padding) tokens in cache
+            kv_cache["k"][:, cache_local:cache_local + actual_s] = k[:, :actual_s]
+            kv_cache["v"][:, cache_local:cache_local + actual_s] = v[:, :actual_s]
+            kv_cache["global_end_index"] = mx.array([cache_global + actual_s], dtype=mx.int32)
+            kv_cache["local_end_index"] = mx.array([cache_local + actual_s], dtype=mx.int32)
+
+            # Use full cached K,V for attention (includes all previous tokens)
+            full_s = cache_local + actual_s
             k = kv_cache["k"][:, :full_s]
             v = kv_cache["v"][:, :full_s]
 
         # SDPA via matmul+softmax
         q_t = q.transpose(0, 2, 1, 3)  # (B, N, S, D)
-        k_t = k.transpose(0, 2, 1, 3)  # (B, N, S, D)
-        v_t = v.transpose(0, 2, 1, 3)  # (B, N, S, D)
+        k_t = k.transpose(0, 2, 1, 3)  # (B, N, S_cache, D) or (B, N, S, D)
+        v_t = v.transpose(0, 2, 1, 3)  # (B, N, S_cache, D) or (B, N, S, D)
 
         attn = mx.matmul(q_t, k_t.transpose(0, 1, 3, 2)) / (d ** 0.5)
 

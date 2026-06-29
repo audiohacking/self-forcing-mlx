@@ -100,7 +100,7 @@ class T5Attention(nn.Module):
         out = mx.matmul(attn, v.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
         out = out.reshape(b, -1, n * c)
         out = self.o(out)
-        out = self.dropout(out, training=training)
+        # MLX Dropout doesn't support training flag; skip for inference
         return out
 
 
@@ -131,9 +131,7 @@ class T5FeedForward(nn.Module):
             Output tensor, same shape.
         """
         out = self.fc1(x) * self.gate(x)
-        out = self.dropout(out, training=training)
         out = self.fc2(out)
-        out = self.dropout(out, training=training)
         return out
 
 
@@ -274,7 +272,6 @@ class T5Encoder(nn.Module):
             Context embeddings, shape (B, L, dim).
         """
         x = self.token_embedding(ids)
-        x = self.dropout(x, training=training)
 
         if self.shared_pos and self.pos_embedding is not None:
             pb = self.pos_embedding(x.shape[1], x.shape[1])
@@ -285,39 +282,48 @@ class T5Encoder(nn.Module):
             x = block(x, mask=mask, pos_bias=pb, training=training)
 
         x = self.norm(x)
-        x = self.dropout(x, training=training)
         return x
 
     def load_weights(self, weights_path):
         """Load weights from a .safetensors file."""
-        import numpy as np
-        from safetensors import safe_open
+        from mlx.utils import tree_flatten, tree_unflatten
+        from safetensors.numpy import load_file
 
-        params = {}
-        with safe_open(weights_path, framework="numpy") as f:
-            for key in f.keys():
-                params[key] = np.array(f.get_tensor(key))
+        weights = load_file(weights_path)
+        mlx_items = self._mlxify_params(dict(weights))
 
-        self.update(self._mlxify_params(params))
+        # Get model parameter names from tree_flatten (leaf arrays only)
+        model_params = dict(tree_flatten(self))
+        model_param_names = set(k for k, v in model_params.items()
+                                if isinstance(v, mx.array))
+
+        # Filter to only matching keys
+        filtered = [(k, mx.array(v)) for k, v in mlx_items.items()
+                     if k in model_param_names]
+        skipped = len(mlx_items) - len(filtered)
+        if skipped:
+            print(f"  Skipped {skipped} unmatched keys")
+
+        self.update(tree_unflatten(filtered))
 
     def _mlxify_params(self, pytorch_params):
-        """Map PyTorch T5 parameter names to MLX names."""
+        """Map PyTorch T5 parameter names to MLX names.
+
+        The safetensors file already uses dot notation (MLX-compatible).
+        Only needed transformation: gate.0 -> gate.layers.0 (MLX Sequential).
+        """
+        import re
         mlx_params = {}
         for key, value in pytorch_params.items():
             ml_key = key
 
-            # Handle encoder prefix
+            # Handle encoder prefix from full checkpoints
             if ml_key.startswith("encoder."):
                 ml_key = ml_key[8:]
 
-            # Handle nested module indices: blocks.0.attn -> blocks[0].attn
-            import re
-            ml_key = re.sub(r'\.(\d+)\.', r'[\1].', ml_key)
-
-            # Handle token_embedding sub-layers
-            if "token_embedding" in ml_key:
-                if "weight" in ml_key:
-                    pass  # keep as is
+            # MLX nn.Sequential stores layers in .layers attribute
+            # gate.0.weight -> gate.layers.0.weight
+            ml_key = re.sub(r'(\.gate)\.(\d+)\.', r'\1.layers.\2.', ml_key)
 
             mlx_params[ml_key] = value
 

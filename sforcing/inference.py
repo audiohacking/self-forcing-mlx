@@ -320,7 +320,7 @@ class MLXPipeline:
         out = self.vae.decode(vae_input)
 
         # Normalize [-1, 1] -> [0, 1]
-        pixels = (out * 0.5 + 0.5).clip(0, 1)
+        pixels = mx.clip(out * 0.5 + 0.5, 0, 1)
         return pixels
 
     def generate(self, prompt, output='output.mp4', num_frames=None):

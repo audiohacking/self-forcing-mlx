@@ -108,11 +108,16 @@ class RMSNorm(nn.Module):
             rms = mx.sqrt(mx.mean(x.astype(mx.float32) ** 2, axis=-1, keepdims=True) + 1e-6)
             x_norm = (x.astype(mx.float32) / rms).astype(x.dtype)
 
-        # Reshape gamma/bias to broadcast with input of arbitrary ndim
-        gamma = self.gamma.reshape(-1, *([1] * (x_norm.ndim - 2)))
+        # Reshape gamma/bias to broadcast with input
+        if self.channel_first:
+            # (B, C, ...) -> gamma: (C, 1, 1, ...)
+            gamma = self.gamma.reshape(-1, *([1] * (x_norm.ndim - 2)))
+        else:
+            # (..., C) -> gamma: (C,) broadcasts naturally
+            gamma = self.gamma
         result = x_norm * self.scale * gamma
         if self.bias is not None:
-            bias = self.bias.reshape(-1, *([1] * (x_norm.ndim - 2)))
+            bias = self.bias.reshape(gamma.shape) if self.channel_first else self.bias
             result = result + bias
         return result
 
@@ -134,7 +139,7 @@ class ResidualBlock(nn.Module):
             nn.Dropout(dropout),
             CausalConv3d(out_dim, out_dim, 3, padding=1),
         )
-        self.shortcut = CausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else None
+        self.shortcut = CausalConv3d(in_dim, out_dim, 1, padding=0) if in_dim != out_dim else None
 
     def __call__(self, x, feat_cache=None, feat_idx=None):
         shortcut = self.shortcut(x) if self.shortcut else x
@@ -160,7 +165,7 @@ class AttentionBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.norm = RMSNorm(dim)
+        self.norm = RMSNorm(dim, channel_first=False)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
 
@@ -477,7 +482,7 @@ class WanVAE(nn.Module):
 
         # Decoder
         self.decoder = Decoder3d(dim, z_dim, dim_mult)
-        self.conv1 = CausalConv3d(z_dim, z_dim, 1)
+        self.conv1 = CausalConv3d(z_dim, z_dim, 1, padding=0)
 
     def clear_cache(self):
         """Clear feature caches."""
@@ -518,7 +523,7 @@ class WanVAE(nn.Module):
             else:
                 out_cat = mx.concatenate([out_cat, out], axis=2)
 
-        return out_cat.clip(-1, 1)
+        return mx.clip(out_cat, -1, 1)
 
     def decode_batch(self, zs, scale=None):
         """Decode a batch of latent tensors."""
@@ -539,16 +544,32 @@ class WanVAE(nn.Module):
         Maps to MLX-compatible naming and handles Conv3d/Conv2d axis permutation.
         Only loads weights that exist in the model (skips encoder-only weights).
         """
-        from mlx.utils import tree_unflatten
+        from mlx.utils import tree_flatten, tree_unflatten
         from safetensors.numpy import load_file
 
         weights = load_file(weights_path)
         mlx_items = self._mlxify_params(dict(weights))
 
+        # Get model parameter names from tree_flatten (leaf arrays only)
+        model_params = dict(tree_flatten(self))
+        model_param_names = set(k for k, v in model_params.items()
+                                if isinstance(v, mx.array))
+
         # Only keep weights that exist in the model
-        model_param_names = set(dict(tree_unflatten(self.parameters())).keys())
-        filtered = [(k, mx.array(v)) for k, v in mlx_items.items()
-                     if k in model_param_names]
+        filtered = []
+        for k, v in mlx_items.items():
+            if k not in model_param_names:
+                continue
+            arr = mx.array(v)
+            target = model_params[k]
+            # Squeeze singleton dims if shape doesn't match
+            # (handles PyTorch->MLX gamma/bias shape diffs: (C,1,1) -> (C,))
+            if arr.shape != target.shape and arr.ndim > target.ndim:
+                arr = arr.squeeze()
+            if arr.shape == target.shape:
+                filtered.append((k, arr))
+            else:
+                print(f"  Shape mismatch: {k} weight={arr.shape} model={target.shape}, skipping")
         skipped = len(mlx_items) - len(filtered)
         if skipped:
             print(f"  Skipped {skipped} encoder-only weights")
@@ -578,10 +599,14 @@ class WanVAE(nn.Module):
             ml_key = re.sub(r'\.(\d+)\.', r'.layers.\1.', ml_key)
 
             # CausalConv3d: add .conv before .weight/.bias
-            # Top-level conv1/conv2
-            ml_key = re.sub(r'^(conv\d+)\.(weight|bias)$', r'\1.conv.\2', ml_key)
-            # decoder.convN
+            # Only match decoder convs (skip encoder conv1/conv2)
             ml_key = re.sub(r'^(decoder\.conv\d+)\.(weight|bias)$', r'\1.conv.\2', ml_key)
+            # WanVAE top-level conv1 (1x1 conv) — only if it's z_dim->z_dim
+            if re.match(r'^conv1\.(weight|bias)$', ml_key) and value.ndim == 5:
+                # The encoder's conv1 has 3 input channels, the decoder's doesn't have top-level conv1
+                # Only the WanVAE wrapper has conv1 (1x1, z_dim->z_dim)
+                # Skip encoder conv1 by checking if in_channels match
+                pass  # handled by generic 5D detection below
             # shortcut
             ml_key = re.sub(r'^(.*\.shortcut)\.(weight|bias)$', r'\1.conv.\2', ml_key)
             # time_conv

@@ -256,6 +256,10 @@ def generate_video_stream(prompt: str, seed: int):
                 current_start_frame + pipeline.num_frame_per_block,
             ]
 
+            # Save cache positions so clean update REPLACES noisy tokens
+            pos_cache_local_pos = [c["local_end_index"].item() for c in kv_caches_pos]
+            pos_cache_local_neg = [c["local_end_index"].item() for c in kv_caches_neg]
+
             # --- Denoising loop ---
             denoising_start = time.time()
             for step_idx, current_timestep in enumerate(pipeline.denoising_step_list):
@@ -293,8 +297,14 @@ def generate_video_stream(prompt: str, seed: int):
             if stop_event.is_set():
                 break
 
-            # --- Update KV cache with clean latents ---
+            # --- Update KV cache with clean latents (replace noisy entries) ---
             if block_idx < num_blocks - 1:
+                # Restore cache positions to overwrite noisy tokens
+                for c, saved_pos in zip(kv_caches_pos, pos_cache_local_pos):
+                    c["local_end_index"] = mx.array([saved_pos], dtype=mx.int32)
+                for c, saved_pos in zip(kv_caches_neg, pos_cache_local_neg):
+                    c["local_end_index"] = mx.array([saved_pos], dtype=mx.int32)
+
                 timestep_zero = mx.array([0], dtype=mx.float32)
                 pipeline._forward_transformer(
                     noisy_input, timestep_zero, context_cond,
@@ -313,7 +323,7 @@ def generate_video_stream(prompt: str, seed: int):
             vae_input = noisy_input.transpose(0, 2, 1, 3, 4)
             pixels = pipeline.vae.decode(vae_input)
             # Normalize [-1, 1] -> [0, 1]
-            pixels = (pixels * 0.5 + 0.5).clip(0, 1)
+            pixels = mx.clip(pixels * 0.5 + 0.5, 0, 1)
             decode_time = time.time() - decode_start
             print(f"  🎨 VAE decode: {decode_time:.2f}s")
 
