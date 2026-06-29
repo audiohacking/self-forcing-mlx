@@ -2,7 +2,8 @@ __pycache__
 *.egg-info
 
 wan_models
-checkpointsmlx-venv/
+checkpoints
+mlx-venv/
 mlx_weights/
 .claude/
 .serena/
